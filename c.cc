@@ -1,6 +1,8 @@
 #include <functional>
 #include <iostream>
 #include <map>
+#include <optional>
+#include <sstream>
 #include <type_traits>
 
 #include <cassert>
@@ -8,10 +10,6 @@
 
 #include <sqlite3.h>
 
-namespace {
-template<class ... A>
-void null(A && ... a) { }
-}
 
 struct Connection;
 
@@ -79,7 +77,67 @@ Parameter<V> * makeParameter(int index, V && value) {
 }
 
 struct Cursor {
-  ~Cursor() { }
+  Cursor(sqlite3_stmt * statement) : statement_(statement) { }
+
+  int columns() const {
+    assert(nullptr != statement_);
+    return sqlite3_column_count(statement_);
+  }
+
+  bool step() const {
+    assert(nullptr != statement_);
+    return sqlite3_step(statement_) == SQLITE_ROW;
+  }
+
+
+  double real(int index) const {
+    assert(nullptr != statement_);
+    return sqlite3_column_double(statement_, index);
+  }
+
+  int integer(int index) const {
+    assert(nullptr != statement_);
+    return sqlite3_column_int(statement_, index);
+  }
+
+  const char * name(int index) const {
+    assert(nullptr != statement_);
+    return sqlite3_column_name(statement_, index);
+  }
+
+#if 0
+  const char * origin(const int index, const char * empty = "") const {
+    assert(nullptr != statement_);
+    const auto origin = sqlite3_column_origin_name(statement_, index);
+    return nullptr != origin ? origin : empty;
+  }
+
+  const char * database(const int index, const char * empty = "") const {
+    assert(nullptr != statement_);
+    const auto database = sqlite3_column_database_name(statement_, index);
+    return nullptr != database ? database : empty;
+  }
+
+  const char * table(const int index, const char * empty = "") const {
+    assert(nullptr != statement_);
+    const auto table = sqlite3_column_table_name(statement_, index);
+    return nullptr != table ? table : empty;
+  }
+#endif
+
+  const char * text(int index, const char * empty = "") const {
+    assert(nullptr != statement_);
+    const auto text = reinterpret_cast<const char *>(sqlite3_column_text(statement_, index));
+    return nullptr != text ? text : empty;
+  }
+
+  const char * type(int index, const char * empty = "") const {
+    assert(nullptr != statement_);
+    const auto type = sqlite3_column_decltype(statement_, index);
+    return nullptr != type ? type : empty;
+  }
+
+  sqlite3_stmt * statement_ = nullptr;
 };
 
 struct Connection {
@@ -97,9 +155,9 @@ struct Connection {
     sqlite3_open(":memory:", &connection_);
   }
 
-  int execute(const char *sql) {
+  int execute(const char * sql) {
     assert(nullptr != connection_);
-    char *error = nullptr;
+    char * error = nullptr;
     const int result = sqlite3_exec(connection_, sql, nullptr, nullptr, &error);
     if (nullptr != error) {
       std::cerr << "error " << error << std::endl;
@@ -110,7 +168,7 @@ struct Connection {
   }
 
   template<std::size_t N>
-  constexpr sqlite3_stmt * prepare(const char (&s)[N]) {
+  constexpr sqlite3_stmt * prepare(const char (& s)[N]) {
     sqlite3_stmt * statement = statements_[s];
     if (nullptr == statement) {
       assert(nullptr != connection_);
@@ -130,7 +188,7 @@ struct Connection {
   }
 
   template<class S>
-  int change(S && s, std::initializer_list<ParameterBase*> && parameters) {
+  int change(S && s, std::initializer_list<ParameterBase *> && parameters) {
     int result = 0;
     auto statement = prepare(s);
     if (nullptr != statement) {
@@ -147,6 +205,50 @@ struct Connection {
     return result;
   }
 
+  template<typename R, class S, typename F>
+  auto read_and_return(S && s, std::initializer_list<ParameterBase *> && parameters, F && f) {
+    std::optional<R> result;
+    auto statement = prepare(s);
+    if (nullptr != statement) {
+      for (auto & parameter : parameters) {
+        parameter->bind(statement);
+        delete parameter;
+      }
+      result = f({statement});
+      sqlite3_reset(statement);
+      sqlite3_clear_bindings(statement);
+    } else {
+      std::cerr << "Unable to parse SQL command..." << std::endl;
+    }
+    return result;
+  }
+
+  template<class S, typename F>
+  void read_no_return(S && s, std::initializer_list<ParameterBase *> && parameters, F && f) {
+    auto statement = prepare(s);
+    if (nullptr != statement) {
+      for (auto & parameter : parameters) {
+        parameter->bind(statement);
+        delete parameter;
+      }
+      f({statement});
+      sqlite3_reset(statement);
+      sqlite3_clear_bindings(statement);
+    } else {
+      std::cerr << "Unable to parse SQL command..." << std::endl;
+    }
+  }
+
+  template<class S, typename F>
+  auto read(S && s, std::initializer_list<ParameterBase *> && parameters, F && f) {
+    using result_type = decltype(std::function{f})::result_type;
+    if constexpr (std::is_void_v<result_type>) {
+      read_no_return(s, std::move(parameters), f);
+    } else {
+      return read_and_return<result_type>(s, std::move(parameters), f);
+    }
+  }
+
   std::map<const char *, sqlite3_stmt *> statements_;
   sqlite3 * connection_ = nullptr;
 };
@@ -154,11 +256,60 @@ struct Connection {
 int main(int, const char * * argv) {
   Connection connection;
 
-  connection.execute("CREATE TABLE Person (name TEXT, Age INTEGER, Address TEXT);");
+  connection.execute("CREATE TABLE Person (Name TEXT, Age INTEGER, Address TEXT);");
 
-  connection.change("INSERT INTO Person (name, age, address) VALUES (:Name, :Age, :Address);", {
+  connection.change("INSERT INTO Person (Name, Age, Address) VALUES (:Name, :Age, :Address);", {
     makeParameter(":Name", "Daniel"),
     makeParameter(":Age", 38),
     makeParameter(":Address", "Colombia"),
   });
+
+  connection.change("INSERT INTO Person (Name, Age, Address) VALUES (:Name, :Age, :Address);", {
+    makeParameter(":Name", "Alberto"),
+    makeParameter(":Age", 42),
+    makeParameter(":Address", "Argentina"),
+  });
+
+  auto table = connection.read("SELECT * FROM Person;", {}, [](Cursor && cursor) {
+      auto trim = [](std::string value, const size_t size) {
+        if (value.size() > size) {
+          value.substr(0, size - 3);
+          value += "...";
+        } else
+          value.resize(size, ' ');
+        return value;
+      };
+
+      std::stringstream buffer;
+
+      const int columns = cursor.columns();
+      std::vector<size_t> column_size(columns);
+
+      for (int i = 0; i < columns; ++i) {
+        std::string columnName = cursor.name(i);
+        columnName += " (";
+        columnName += cursor.type(i);
+        columnName += ')';
+        column_size[i] = columnName.size();
+        columnName += " |";
+        if (i + 1 < columns)
+          columnName += ' ';
+        buffer << columnName.c_str();
+      }
+
+      const size_t header_size = buffer.str().size();
+      buffer << std::endl << std::string(header_size, '-') << std::endl;
+
+      while (cursor.step()) {
+        for (int i = 0; i < columns; ++i)
+          buffer << trim(cursor.text(i), column_size[i]) << " | ";
+        buffer << std::endl;
+      }
+
+      return buffer.str();
+  });
+
+  if (table) {
+    std::cout << *table;
+  }
 }
