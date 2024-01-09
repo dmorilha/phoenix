@@ -8,8 +8,13 @@
 #include <cassert>
 #include <cstring>
 
-#include <sqlite3.h>
+#include <boost/asio/dispatch.hpp>
+#include <boost/asio/ip/tcp.hpp>
+#include <boost/asio/strand.hpp>
+#include <boost/beast.hpp>
+#include <boost/beast/http.hpp>
 
+#include <sqlite3.h>
 
 struct Connection;
 
@@ -253,6 +258,130 @@ struct Connection {
   sqlite3 * connection_ = nullptr;
 };
 
+namespace http {
+  namespace beast = boost::beast;
+  namespace net = boost::asio;
+  using tcp = boost::asio::ip::tcp;
+
+  template <class Body, class Allocator>
+  beast::http::message_generator
+  handle_request(beast::http::request<Body, beast::http::basic_fields<Allocator>> && request) {
+    if (beast::http::verb::get != request.method()) {
+      // bad_requestuest("Unknown HTTP-method");
+    }
+
+    static const std::string content = "Hello World!";
+
+    beast::error_code error_code;
+    beast::http::file_body::value_type body;
+
+    beast::http::response<beast::http::string_body> response(
+      beast::http::status::ok, request.version());
+
+    response.set(beast::http::field::server, BOOST_BEAST_VERSION_STRING);
+    response.set(beast::http::field::content_type, "text/plain");
+    response.content_length(content.size());
+    response.keep_alive(request.keep_alive());
+    response.body() = content;
+    response.prepare_payload();
+
+    return response;
+  }
+
+  struct Session : public std::enable_shared_from_this<Session> {
+    beast::tcp_stream stream_;
+    beast::flat_buffer buffer_;
+    beast::http::request<beast::http::string_body> request_;
+
+    Session(tcp::socket && socket) :
+      stream_(std::move(socket)) { }
+
+    void run() {
+      net::dispatch(stream_.get_executor(),
+          std::bind_front(&Session::read, shared_from_this()));
+    }
+
+    void read() {
+      beast::http::async_read(stream_, buffer_, request_,
+          std::bind_front(&Session::on_read, shared_from_this()));
+    }
+
+    void on_read(beast::error_code error_code, std::size_t bytes_transferred) {
+      static const bool keep_alive = true;
+
+      if (beast::http::error::end_of_stream == error_code) {
+        close();
+      }
+
+      beast::async_write(stream_,
+          handle_request(std::move(request_)),
+          std::bind_front(&Session::on_write, shared_from_this(), keep_alive));
+    }
+
+    void on_write(bool keep_alive, beast::error_code error_code, std::size_t bytes_transferred) {
+      if (error_code) {
+      }
+
+      close();
+
+      std::exit(0); /* just one request for now */
+    }
+
+    void close() {
+      beast::error_code error_code;
+      stream_.socket().shutdown(tcp::socket::shutdown_send, error_code);
+    }
+  };
+
+  struct Listener : public std::enable_shared_from_this<Listener> {
+
+    Listener(net::io_context & io_context) :
+      io_context_(io_context),
+      acceptor_(net::make_strand(io_context_)) { }
+
+    Listener * listen(tcp::endpoint endpoint) {
+      beast::error_code error_code;
+
+      acceptor_.open(endpoint.protocol(), error_code);
+      if (error_code) {
+      }
+
+      acceptor_.set_option(net::socket_base::reuse_address(true), error_code);
+      if (error_code) {
+      }
+
+      acceptor_.bind(endpoint, error_code);
+      if (error_code) {
+      }
+
+      acceptor_.listen(/* number of simultaneous connections */ 2, error_code);
+      if (error_code) {
+      }
+
+      return this;
+    }
+
+    void accept() {
+      acceptor_.async_accept(net::make_strand(io_context_),
+          std::bind_front(
+            &Listener::on_accept,
+            shared_from_this()));
+    }
+
+    void on_accept(beast::error_code error_code, tcp::socket socket) {
+      if (error_code) {
+        return;
+      } else {
+        std::make_shared<Session>(std::move(socket))->run();
+      }
+      accept();
+    }
+
+    net::io_context & io_context_;
+    tcp::acceptor acceptor_;
+  };
+};
+
 int main(int, const char * * argv) {
   Connection connection;
 
@@ -269,6 +398,16 @@ int main(int, const char * * argv) {
     makeParameter(":Age", 42),
     makeParameter(":Address", "Argentina"),
   });
+
+  http::net::io_context io_context;
+
+  std::make_shared<http::Listener>(io_context)
+    ->listen(http::tcp::endpoint(http::net::ip::make_address("127.0.0.1"), 8080))
+    ->accept();
+
+  io_context.run();
+
+  return 0;
 
   auto table = connection.read("SELECT * FROM Person;", {}, [](Cursor && cursor) {
       auto trim = [](std::string value, const size_t size) {
@@ -312,4 +451,6 @@ int main(int, const char * * argv) {
   if (table) {
     std::cout << *table;
   }
+
+  return 0;
 }
