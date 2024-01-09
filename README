@@ -1,3 +1,5 @@
 Spare time project.
 
-Currently trying to plug SQLITE into boost ASIO efficiently and with a user-friendly API.
+Currently trying to plug SQLITE into boost ASIO/BEAST efficiently and with an user-friendly API.
+
+Tested against boost-1.82
