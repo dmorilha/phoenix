@@ -18,6 +18,7 @@
 
 namespace database {
   struct Connection;
+  struct Pool;
 
   struct ParameterBase {
     int bind(sqlite3_stmt * statement, int index, double value) {
@@ -44,6 +45,8 @@ namespace database {
     virtual ~ParameterBase() = default;
     virtual int bind(sqlite3_stmt *) = 0;
   };
+
+  using ParameterList = std::initializer_list<ParameterBase *>;
 
   template<class V>
   struct NamedParameter : ParameterBase {
@@ -195,7 +198,7 @@ namespace database {
     }
 
     template<class S>
-    int change(S && s, std::initializer_list<ParameterBase *> && parameters) {
+    int change(S && s, ParameterList && parameters) {
       int result = 0;
       auto statement = prepare(s);
       if (nullptr != statement) {
@@ -213,7 +216,7 @@ namespace database {
     }
 
     template<typename R, class S, typename F>
-    auto read_and_return(S && s, std::initializer_list<ParameterBase *> && parameters, F && f) {
+    auto read_and_return(S && s, ParameterList && parameters, F && f) {
       std::optional<R> result;
       auto statement = prepare(s);
       if (nullptr != statement) {
@@ -231,7 +234,7 @@ namespace database {
     }
 
     template<class S, typename F>
-    void read_no_return(S && s, std::initializer_list<ParameterBase *> && parameters, F && f) {
+    void read_no_return(S && s, ParameterList && parameters, F && f) {
       auto statement = prepare(s);
       if (nullptr != statement) {
         for (auto & parameter : parameters) {
@@ -247,7 +250,7 @@ namespace database {
     }
 
     template<class S, typename F>
-    auto read(S && s, std::initializer_list<ParameterBase *> && parameters, F && f) {
+    auto read(S && s, ParameterList && parameters, F && f) {
       using result_type = decltype(std::function{f})::result_type;
       if constexpr (std::is_void_v<result_type>) {
         read_no_return(s, std::move(parameters), f);
@@ -259,94 +262,71 @@ namespace database {
     std::map<const char *, sqlite3_stmt *> statements_;
     sqlite3 * connection_ = nullptr;
   };
+
+  struct ConnectionProxy {
+    ~ConnectionProxy() { }
+    ConnectionProxy(Connection * connection, Pool * pool) : connection_(connection), pool_(pool) { }
+
+    template<class ... Args>
+    auto change(Args && ... args) {
+      assert(nullptr != connection_);
+      return connection_->change(std::forward<Args>(args)...);
+    }
+
+    template<class ... Args>
+    auto execute(Args && ... args) {
+      assert(nullptr != connection_);
+      return connection_->execute(std::forward<Args>(args)...);
+    }
+
+    template<class ... Args>
+    auto read(Args && ... args) {
+      assert(nullptr != connection_);
+      return connection_->read(std::forward<Args>(args)...);
+    }
+
+    Connection * connection_;
+    Pool * pool_;
+  };
+
+  struct Pool {
+    Pool(const char * path) : path_(path) { }
+    ConnectionProxy getConnection() {
+      return ConnectionProxy(new Connection(path_.c_str()), this);
+    }
+    std::vector<Connection> connections_;
+    std::string path_;
+  };
 }
+
+using DatabasePool = std::shared_ptr<database::Pool>;
 
 namespace http {
   namespace beast = boost::beast;
   namespace net = boost::asio;
   using tcp = boost::asio::ip::tcp;
 
-  template <class Body, class Allocator>
-  beast::http::message_generator
-  handle_request(beast::http::request<Body, beast::http::basic_fields<Allocator>> && request) {
-    database::Connection connection("database.sql");
-
-    auto table = connection.read("SELECT * FROM Person;", {}, [](database::Cursor && cursor) {
-        auto trim = [](std::string value, const size_t size) {
-          if (value.size() > size) {
-            value.substr(0, size - 3);
-            value += "...";
-          } else
-            value.resize(size, ' ');
-          return value;
-        };
-
-        std::stringstream buffer;
-
-        const int columns = cursor.columns();
-        std::vector<size_t> column_size(columns);
-
-        for (int i = 0; i < columns; ++i) {
-          std::string columnName = cursor.name(i);
-          columnName += " (";
-          columnName += cursor.type(i);
-          columnName += ')';
-          column_size[i] = columnName.size();
-          columnName += " |";
-          if (i + 1 < columns)
-            columnName += ' ';
-          buffer << columnName.c_str();
-        }
-
-        const size_t header_size = buffer.str().size();
-        buffer << std::endl << std::string(header_size, '-') << std::endl;
-
-        while (cursor.step()) {
-          for (int i = 0; i < columns; ++i)
-            buffer << trim(cursor.text(i), column_size[i]) << " | ";
-          buffer << std::endl;
-        }
-
-        return buffer.str();
-    });
-
-    beast::error_code error_code;
-    beast::http::file_body::value_type body;
-
-    beast::http::response<beast::http::string_body> response(
-      beast::http::status::ok, request.version());
-
-    response.set(beast::http::field::server, BOOST_BEAST_VERSION_STRING);
-    response.set(beast::http::field::content_type, "text/plain");
-    response.keep_alive(request.keep_alive());
-    std::string content = "(empty)";
-    if (table) {
-      content = *table;
-    }
-    response.content_length(content.size());
-    response.body() = content;
-    response.prepare_payload();
-
-    return response;
-  }
-
-  struct Session : public std::enable_shared_from_this<Session> {
+  struct SessionBase : public std::enable_shared_from_this<SessionBase> {
     beast::tcp_stream stream_;
     beast::flat_buffer buffer_;
     beast::http::request<beast::http::string_body> request_;
 
-    Session(tcp::socket && socket) :
+    virtual ~SessionBase() = default;
+
+    SessionBase(tcp::socket && socket) :
       stream_(std::move(socket)) { }
 
     void run() {
       net::dispatch(stream_.get_executor(),
-          std::bind_front(&Session::read, shared_from_this()));
+          std::bind_front(&SessionBase::read, shared_from_this()));
     }
 
     void read() {
       beast::http::async_read(stream_, buffer_, request_,
-          std::bind_front(&Session::on_read, shared_from_this()));
+          std::bind_front(&SessionBase::on_read, shared_from_this()));
     }
+
+    virtual void on_request() = 0;
 
     void on_read(beast::error_code error_code, std::size_t bytes_transferred) {
       static const bool keep_alive = true;
@@ -355,9 +335,7 @@ namespace http {
         close();
       }
 
-      beast::async_write(stream_,
-          handle_request(std::move(request_)),
-          std::bind_front(&Session::on_write, shared_from_this(), keep_alive));
+      on_request();
     }
 
     void on_write(bool keep_alive, beast::error_code error_code, std::size_t bytes_transferred) {
@@ -376,7 +354,6 @@ namespace http {
   };
 
   struct Listener : public std::enable_shared_from_this<Listener> {
-
     Listener(net::io_context & io_context) :
       io_context_(io_context),
       acceptor_(net::make_strand(io_context_)) { }
@@ -396,27 +373,26 @@ namespace http {
       if (error_code) {
       }
 
-      acceptor_.listen(/* number of simultaneous connections */ 1, error_code);
+      acceptor_.listen(/* number of simultaneous connections */ 2, error_code);
       if (error_code) {
       }
 
       return this;
     }
 
-    void accept() {
+    template<class Session, class Tuple>
+    void accept(Tuple && tuple) {
       acceptor_.async_accept(net::make_strand(io_context_),
-          std::bind_front(
-            &Listener::on_accept,
-            shared_from_this()));
+          std::bind_front(&Listener::on_accept<Session, Tuple>, shared_from_this(), std::move(tuple)));
     }
 
-    void on_accept(beast::error_code error_code, tcp::socket socket) {
-      if (error_code) {
-        return;
-      } else {
-        std::make_shared<Session>(std::move(socket))->run();
-      }
-      accept();
+    template<class Session, class Tuple>
+    void on_accept(Tuple && tuple, beast::error_code error_code, tcp::socket socket) {
+      if (error_code) { return; }
+      auto session = std::make_shared<Session>(std::move(socket));
+      session->initialize(tuple);
+      session->run();
+      accept<Session>(std::move(tuple));
     }
 
     net::io_context & io_context_;
@@ -424,28 +400,111 @@ namespace http {
   };
 };
 
+struct MySession : public http::SessionBase {
+  std::shared_ptr<database::Pool> pool_;
+
+  template <class ... Args>
+    MySession(Args && ... args) : SessionBase(std::forward<Args>(args)...) { }
+
+  void initialize(const std::tuple<DatabasePool> & input) {
+    pool_ = std::move(std::get<0>(input));
+  }
+
+  template <class Body, class Allocator>
+    boost::beast::http::message_generator
+    handle_request(boost::beast::http::request<Body, boost::beast::http::basic_fields<Allocator>> && request) {
+      assert(nullptr != pool_);
+      auto connection = pool_->getConnection();
+
+      auto table = connection.read("SELECT * FROM Person;", database::ParameterList{}, [](database::Cursor && cursor) {
+          auto trim = [](std::string value, const size_t size) {
+          if (value.size() > size) {
+          value.substr(0, size - 3);
+          value += "...";
+          } else
+          value.resize(size, ' ');
+          return value;
+          };
+
+          std::stringstream buffer;
+
+          const int columns = cursor.columns();
+          std::vector<size_t> column_size(columns);
+
+          for (int i = 0; i < columns; ++i) {
+          std::string columnName = cursor.name(i);
+          columnName += " (";
+          columnName += cursor.type(i);
+          columnName += ')';
+          column_size[i] = columnName.size();
+          columnName += " |";
+          if (i + 1 < columns)
+            columnName += ' ';
+          buffer << columnName.c_str();
+          }
+
+          const size_t header_size = buffer.str().size();
+          buffer << std::endl << std::string(header_size, '-') << std::endl;
+
+          while (cursor.step()) {
+            for (int i = 0; i < columns; ++i)
+              buffer << trim(cursor.text(i), column_size[i]) << " | ";
+            buffer << std::endl;
+          }
+
+          return buffer.str();
+      });
+
+      boost::beast::error_code error_code;
+      boost::beast::http::file_body::value_type body;
+
+      boost::beast::http::response<boost::beast::http::string_body> response(
+          boost::beast::http::status::ok, request.version());
+
+      response.set(boost::beast::http::field::server, BOOST_BEAST_VERSION_STRING);
+      response.set(boost::beast::http::field::content_type, "text/plain");
+      response.keep_alive(request.keep_alive());
+      std::string content = "(empty)";
+      if (table) {
+        content = *table;
+      }
+      response.content_length(content.size());
+      response.body() = content;
+      response.prepare_payload();
+
+      return response;
+    }
+
+  void on_request() {
+    boost::beast::async_write(stream_,
+        handle_request(std::move(request_)),
+        std::bind_front(&SessionBase::on_write, shared_from_this(), false));
+  }
+};
+
 int main(int, const char * * argv) {
-  database::Connection connection(/* leaks database file after completion */ "database.sql");
+  auto pool = DatabasePool(new database::Pool("database.sql"));
+  auto connection = pool->getConnection();
 
   connection.execute("CREATE TABLE IF NOT EXISTS Person (Name TEXT PRIMARY KEY, Age INTEGER, Address TEXT);");
 
-  connection.change("INSERT INTO Person (Name, Age, Address) VALUES (:Name, :Age, :Address);", {
-    database::makeParameter(":Name", "Daniel"),
-    database::makeParameter(":Age", 38),
-    database::makeParameter(":Address", "Colombia"),
-  });
+  connection.change("INSERT INTO Person (Name, Age, Address) VALUES (:Name, :Age, :Address);",
+    database::ParameterList{
+      database::makeParameter(":Name", "Daniel"),
+      database::makeParameter(":Age", 38),
+      database::makeParameter(":Address", "Colombia")});
 
-  connection.change("INSERT INTO Person (Name, Age, Address) VALUES (:Name, :Age, :Address);", {
-    database::makeParameter(":Name", "Alberto"),
-    database::makeParameter(":Age", 42),
-    database::makeParameter(":Address", "Argentina"),
-  });
+  connection.change("INSERT INTO Person (Name, Age, Address) VALUES (:Name, :Age, :Address);",
+    database::ParameterList{
+      database::makeParameter(":Name", "Alberto"),
+      database::makeParameter(":Age", 42),
+      database::makeParameter(":Address", "Argentina")});
 
   http::net::io_context io_context;
 
   std::make_shared<http::Listener>(io_context)
     ->listen(http::tcp::endpoint(http::net::ip::make_address("127.0.0.1"), 8080))
-    ->accept();
+    ->accept<MySession>(std::make_tuple(pool));
 
   io_context.run();
 
