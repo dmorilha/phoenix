@@ -1,4 +1,5 @@
 #include <functional>
+#include <future>
 #include <iostream>
 #include <map>
 #include <optional>
@@ -16,8 +17,9 @@
 
 #include <sqlite3.h>
 
+#include "database.h"
+
 namespace database {
-  struct Connection;
   struct Pool;
 
   struct ParameterBase {
@@ -40,6 +42,11 @@ namespace database {
 
     int bind(sqlite3_stmt * statement, int index, char * value, int size) {
       return sqlite3_bind_text(statement, index, value, size, nullptr);
+    }
+
+    int bind(sqlite3_stmt * statement, int index, const std::string & value) {
+      char * const dup = strdup(value.c_str());
+      return sqlite3_bind_text(statement, index, dup, value.size(), nullptr);
     }
 
     virtual ~ParameterBase() = default;
@@ -264,7 +271,11 @@ namespace database {
   };
 
   struct ConnectionProxy {
-    ~ConnectionProxy() { }
+    ~ConnectionProxy() {
+      assert(nullptr != pool_);
+      pool_->release(connection_);
+    }
+
     ConnectionProxy(Connection * connection, Pool * pool) : connection_(connection), pool_(pool) { }
 
     template<class ... Args>
@@ -289,14 +300,37 @@ namespace database {
     Pool * pool_;
   };
 
-  struct Pool {
-    Pool(const char * path) : path_(path) { }
-    ConnectionProxy getConnection() {
-      return ConnectionProxy(new Connection(path_.c_str()), this);
+  Pool::~Pool() {
+    for (auto & item : connections_) {
+      delete item.first;
     }
-    std::vector<Connection> connections_;
-    std::string path_;
-  };
+    connections_.clear();
+  }
+
+  Pool::Pool(const char * path, const size_t size = 4) : path_(path), size_(size) { }
+
+  std::future<ConnectionProxy> Pool::getConnection() {
+    std::promise<ConnectionProxy> promise;
+    for (auto & item : connections_) {
+      if (item.second) {
+        item.second = false;
+        promise.set_value(ConnectionProxy(item.first, this));
+        return promise.get_future();
+      }
+    }
+    if (size_ > connections_.size()) {
+      auto * const connection = new Connection(path_.c_str());
+      connections_.insert({connection, false});
+      promise.set_value(ConnectionProxy(new Connection(path_.c_str()), this));
+    } else {
+      throw std::runtime_error("no more connections");
+    }
+    return promise.get_future();
+  }
+
+  void Pool::release(Connection * const connection) {
+    connections_[connection] = true;
+  }
 }
 
 using DatabasePool = std::shared_ptr<database::Pool>;
@@ -411,36 +445,39 @@ struct MySession : public http::SessionBase {
   }
 
   template <class Body, class Allocator>
+  std::string serializeRequest(const boost::beast::http::request<Body, boost::beast::http::basic_fields<Allocator>> & request) {
+    std::stringstream buffer;
+    buffer << request.method() << " " << request.target() << " " << request.version() << " ; ";
+    for (const auto & item : request) {
+      buffer << item.name() << ": " << item.value() << " ; ";
+    }
+    return buffer.str();
+  }
+
+  template <class Body, class Allocator>
     boost::beast::http::message_generator
     handle_request(boost::beast::http::request<Body, boost::beast::http::basic_fields<Allocator>> && request) {
       assert(nullptr != pool_);
-      auto connection = pool_->getConnection();
 
-      auto table = connection.read("SELECT * FROM Person;", database::ParameterList{}, [](database::Cursor && cursor) {
-          auto trim = [](std::string value, const size_t size) {
-          if (value.size() > size) {
-          value.substr(0, size - 3);
-          value += "...";
-          } else
-          value.resize(size, ' ');
-          return value;
-          };
+      auto connection = pool_->getConnection().get();
 
+      connection.change("INSERT INTO Request (request) VALUES (:request);",
+          database::ParameterList{database::makeParameter(":request", serializeRequest(request))});
+
+      auto table = connection.read("SELECT * FROM Request;", database::ParameterList{}, [](database::Cursor && cursor) {
           std::stringstream buffer;
 
           const int columns = cursor.columns();
-          std::vector<size_t> column_size(columns);
 
           for (int i = 0; i < columns; ++i) {
-          std::string columnName = cursor.name(i);
-          columnName += " (";
-          columnName += cursor.type(i);
-          columnName += ')';
-          column_size[i] = columnName.size();
-          columnName += " |";
-          if (i + 1 < columns)
-            columnName += ' ';
-          buffer << columnName.c_str();
+            std::string columnName = cursor.name(i);
+            columnName += " (";
+            columnName += cursor.type(i);
+            columnName += ')';
+            columnName += " | ";
+            if (i + 1 < columns)
+              columnName += ' ';
+            buffer << columnName.c_str();
           }
 
           const size_t header_size = buffer.str().size();
@@ -448,7 +485,7 @@ struct MySession : public http::SessionBase {
 
           while (cursor.step()) {
             for (int i = 0; i < columns; ++i)
-              buffer << trim(cursor.text(i), column_size[i]) << " | ";
+              buffer << cursor.text(i);
             buffer << std::endl;
           }
 
@@ -484,21 +521,9 @@ struct MySession : public http::SessionBase {
 
 int main(int, const char * * argv) {
   auto pool = DatabasePool(new database::Pool("database.sql"));
-  auto connection = pool->getConnection();
+  auto connection = pool->getConnection().get();
 
-  connection.execute("CREATE TABLE IF NOT EXISTS Person (Name TEXT PRIMARY KEY, Age INTEGER, Address TEXT);");
-
-  connection.change("INSERT INTO Person (Name, Age, Address) VALUES (:Name, :Age, :Address);",
-    database::ParameterList{
-      database::makeParameter(":Name", "Daniel"),
-      database::makeParameter(":Age", 38),
-      database::makeParameter(":Address", "Colombia")});
-
-  connection.change("INSERT INTO Person (Name, Age, Address) VALUES (:Name, :Age, :Address);",
-    database::ParameterList{
-      database::makeParameter(":Name", "Alberto"),
-      database::makeParameter(":Age", 42),
-      database::makeParameter(":Address", "Argentina")});
+  connection.execute("CREATE TABLE IF NOT EXISTS Request (request TEXT);");
 
   http::net::io_context io_context;
 
