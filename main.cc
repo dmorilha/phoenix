@@ -2,9 +2,12 @@
 #include <future>
 #include <iostream>
 #include <map>
+#include <mutex>
 #include <optional>
 #include <sstream>
+#include <thread>
 #include <type_traits>
+#include <vector>
 
 #include <cassert>
 #include <cstring>
@@ -177,7 +180,6 @@ namespace database {
       char * error = nullptr;
       const int result = sqlite3_exec(connection_, sql, nullptr, nullptr, &error);
       if (nullptr != error) {
-        std::cerr << "error " << error << std::endl;
         sqlite3_free(error);
         error = nullptr;
       }
@@ -272,11 +274,24 @@ namespace database {
 
   struct ConnectionProxy {
     ~ConnectionProxy() {
-      assert(nullptr != pool_);
-      pool_->release(connection_);
+      if (nullptr != connection_) {
+        assert(nullptr != pool_);
+        pool_->release(connection_);
+      }
     }
 
     ConnectionProxy(Connection * connection, Pool * pool) : connection_(connection), pool_(pool) { }
+
+    ConnectionProxy(ConnectionProxy && other) {
+      pool_ = other.pool_;
+      other.pool_ = nullptr;
+      connection_ = other.connection_;
+      other.connection_ = nullptr;
+    }
+
+    ConnectionProxy(const ConnectionProxy &) = delete;
+    ConnectionProxy & operator =(const ConnectionProxy &) = delete;
+    ConnectionProxy & operator =(ConnectionProxy &&) = delete;
 
     template<class ... Args>
     auto change(Args && ... args) {
@@ -307,29 +322,38 @@ namespace database {
     connections_.clear();
   }
 
-  Pool::Pool(const char * path, const size_t size = 4) : path_(path), size_(size) { }
+  Pool::Pool(const char * path, const size_t size = 4) :
+    path_(path), size_(size), available_(0) { }
 
+  // it should provide with a timeout parameter.
   std::future<ConnectionProxy> Pool::getConnection() {
+    std::unique_lock<std::mutex> lock(mutex_);
     std::promise<ConnectionProxy> promise;
-    for (auto & item : connections_) {
-      if (item.second) {
-        item.second = false;
-        promise.set_value(ConnectionProxy(item.first, this));
-        return promise.get_future();
-      }
-    }
     if (size_ > connections_.size()) {
       auto * const connection = new Connection(path_.c_str());
       connections_.insert({connection, false});
       promise.set_value(ConnectionProxy(new Connection(path_.c_str()), this));
-    } else {
-      throw std::runtime_error("no more connections");
+      return promise.get_future();
     }
-    return promise.get_future();
+
+    while (true) {
+      condition_variable_.wait(lock, [this]{ return 0 < available_; });
+      for (auto & item : connections_) {
+        if (item.second) {
+          item.second = false;
+          --available_;
+          promise.set_value(ConnectionProxy(item.first, this));
+          return promise.get_future();
+        }
+      }
+    }
   }
 
   void Pool::release(Connection * const connection) {
+    std::lock_guard<std::mutex> lock(mutex_);
     connections_[connection] = true;
+    ++available_;
+    condition_variable_.notify_one();
   }
 }
 
@@ -373,12 +397,8 @@ namespace http {
     }
 
     void on_write(bool keep_alive, beast::error_code error_code, std::size_t bytes_transferred) {
-      if (error_code) {
-      }
-
+      if (error_code) { }
       close();
-
-      std::exit(0); /* just one request for now */
     }
 
     void close() {
@@ -396,20 +416,16 @@ namespace http {
       beast::error_code error_code;
 
       acceptor_.open(endpoint.protocol(), error_code);
-      if (error_code) {
-      }
+      if (error_code) { }
 
       acceptor_.set_option(net::socket_base::reuse_address(true), error_code);
-      if (error_code) {
-      }
+      if (error_code) { }
 
       acceptor_.bind(endpoint, error_code);
-      if (error_code) {
-      }
+      if (error_code) { }
 
-      acceptor_.listen(/* number of simultaneous connections */ 2, error_code);
-      if (error_code) {
-      }
+      acceptor_.listen(/* number of simultaneous connections */ 16, error_code);
+      if (error_code) { }
 
       return this;
     }
@@ -530,6 +546,15 @@ int main(int, const char * * argv) {
   std::make_shared<http::Listener>(io_context)
     ->listen(http::tcp::endpoint(http::net::ip::make_address("127.0.0.1"), 8080))
     ->accept<MySession>(std::make_tuple(pool));
+
+  const size_t THREAD_COUNT = 4;
+  std::vector<std::thread> threads;
+  threads.reserve(THREAD_COUNT);
+  for (auto i = THREAD_COUNT - 1; i > 0; --i) {
+    threads.emplace_back([&io_context]{
+      io_context.run();
+    });
+  }
 
   io_context.run();
 
