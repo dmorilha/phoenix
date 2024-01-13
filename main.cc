@@ -14,6 +14,7 @@
 
 #include <boost/asio/dispatch.hpp>
 #include <boost/asio/ip/tcp.hpp>
+#include <boost/asio/signal_set.hpp>
 #include <boost/asio/strand.hpp>
 #include <boost/beast.hpp>
 #include <boost/beast/http.hpp>
@@ -361,7 +362,7 @@ using DatabasePool = std::shared_ptr<database::Pool>;
 
 namespace http {
   namespace beast = boost::beast;
-  namespace net = boost::asio;
+  namespace asio = boost::asio;
   using tcp = boost::asio::ip::tcp;
 
   struct SessionBase : public std::enable_shared_from_this<SessionBase> {
@@ -375,7 +376,7 @@ namespace http {
       stream_(std::move(socket)) { }
 
     void run() {
-      net::dispatch(stream_.get_executor(),
+      asio::dispatch(stream_.get_executor(),
           std::bind_front(&SessionBase::read, shared_from_this()));
     }
 
@@ -408,9 +409,9 @@ namespace http {
   };
 
   struct Listener : public std::enable_shared_from_this<Listener> {
-    Listener(net::io_context & io_context) :
+    Listener(asio::io_context & io_context) :
       io_context_(io_context),
-      acceptor_(net::make_strand(io_context_)) { }
+      acceptor_(asio::make_strand(io_context_)) { }
 
     Listener * listen(tcp::endpoint endpoint) {
       beast::error_code error_code;
@@ -418,7 +419,7 @@ namespace http {
       acceptor_.open(endpoint.protocol(), error_code);
       if (error_code) { }
 
-      acceptor_.set_option(net::socket_base::reuse_address(true), error_code);
+      acceptor_.set_option(asio::socket_base::reuse_address(true), error_code);
       if (error_code) { }
 
       acceptor_.bind(endpoint, error_code);
@@ -432,7 +433,7 @@ namespace http {
 
     template<class Session, class Tuple>
     void accept(Tuple && tuple) {
-      acceptor_.async_accept(net::make_strand(io_context_),
+      acceptor_.async_accept(asio::make_strand(io_context_),
           std::bind_front(&Listener::on_accept<Session, Tuple>, shared_from_this(), std::move(tuple)));
     }
 
@@ -445,7 +446,11 @@ namespace http {
       accept<Session>(std::move(tuple));
     }
 
-    net::io_context & io_context_;
+    void close() {
+      acceptor_.close();
+    }
+
+    asio::io_context & io_context_;
     tcp::acceptor acceptor_;
   };
 };
@@ -535,16 +540,18 @@ struct MySession : public http::SessionBase {
   }
 };
 
+
 int main(int, const char * * argv) {
   auto pool = DatabasePool(new database::Pool("database.sql"));
   auto connection = pool->getConnection().get();
 
   connection.execute("CREATE TABLE IF NOT EXISTS Request (request TEXT);");
 
-  http::net::io_context io_context;
+  http::asio::io_context io_context;
 
-  std::make_shared<http::Listener>(io_context)
-    ->listen(http::tcp::endpoint(http::net::ip::make_address("127.0.0.1"), 8080))
+  auto listener = std::make_shared<http::Listener>(io_context);
+
+  listener->listen(http::tcp::endpoint(http::asio::ip::make_address("127.0.0.1"), 8080))
     ->accept<MySession>(std::make_tuple(pool));
 
   const size_t THREAD_COUNT = 4;
@@ -556,7 +563,17 @@ int main(int, const char * * argv) {
     });
   }
 
+  boost::asio::signal_set signals(io_context, SIGINT, SIGTERM);
+  signals.async_wait([&io_context, &listener](const std::error_code error_code, const int signal){
+    listener->close();
+    io_context.stop();
+  });
+
   io_context.run();
+
+  for (auto & thread : threads) {
+    thread.join();
+  }
 
   return 0;
 }
