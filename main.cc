@@ -187,23 +187,39 @@ namespace database {
       return result;
     }
 
+    // static
     template<std::size_t N>
     constexpr sqlite3_stmt * prepare(const char (& s)[N]) {
-      sqlite3_stmt * statement = statements_[s];
+      const std::size_t index = reinterpret_cast<std::size_t>(std::addressof(s));
+      sqlite3_stmt * statement = statements_[index];
       if (nullptr == statement) {
         assert(nullptr != connection_);
         const auto result = sqlite3_prepare_v2(connection_, s, strlen(s), &statement, nullptr);
+        statements_[index] = statement;
       }
       return statement;
     }
+
+    // dynamic
+    sqlite3_stmt * prepare(const std::string & s) {
+      static std::hash<std::string> hash;
+      const std::size_t index = hash(s);
+      sqlite3_stmt * statement = statements_[index];
+      if (nullptr == statement) {
+        assert(nullptr != connection_);
+        const auto result = sqlite3_prepare_v2(connection_, s.c_str(), s.size(), &statement, nullptr);
+        statements_[index] = statement;
+      }
+      return statement;
+    }
+
 
     template<class T>
     constexpr sqlite3_stmt * prepare(T && t) {
       if (std::is_constant_evaluated())
         return prepare(std::forward<T>(t));
       else
-        std::cerr << "don't bother for now..." << std::endl;
-        assert(!"don't bother for now...");
+        return prepare(std::ref(t));
       return nullptr;
     }
 
@@ -269,7 +285,7 @@ namespace database {
       }
     }
 
-    std::map<const char *, sqlite3_stmt *> statements_;
+    std::map<const std::size_t, sqlite3_stmt *> statements_;
     sqlite3 * connection_ = nullptr;
   };
 
