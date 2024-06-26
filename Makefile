@@ -12,3 +12,6 @@ a.out : $(objects)
 
 %.o : %.cc
 	$(CXX) -std=c++20 -o $@ -c $<
+
+clean:
+	rm -rfv $(objects)
