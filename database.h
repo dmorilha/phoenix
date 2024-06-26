@@ -2,6 +2,7 @@
 #define DATABASE_H
 
 #include <condition_variable>
+#include <deque>
 #include <future>
 #include <iostream>
 #include <map>
@@ -161,7 +162,7 @@ struct Connection {
     }
   }
 
-  std::map<const std::size_t, sqlite3_stmt *> statements_;
+  std::map<std::size_t, sqlite3_stmt *> statements_;
   sqlite3 * connection_ = nullptr;
 };
 
@@ -214,7 +215,8 @@ struct Pool {
   size_t available_;
   std::condition_variable condition_variable_;
   std::map<Connection *, bool> connections_;
-  std::mutex mutex_;
+  std::deque<std::promise<ConnectionProxy>> queue_;
+  std::recursive_mutex mutex_;
 };
 
 struct Cursor {

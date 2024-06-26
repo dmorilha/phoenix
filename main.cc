@@ -100,10 +100,11 @@ struct MySession : public http::SessionBase {
 
 
 int main(int, const char * * argv) {
-  auto pool = DatabasePool(new database::Pool("database.sql"));
-  auto connection = pool->getConnection().get();
-
-  connection.execute("CREATE TABLE IF NOT EXISTS Request (request TEXT);");
+  auto pool = DatabasePool(new database::Pool("database.sql", 1));
+  {
+    auto connection = pool->getConnection().get();
+    connection.execute("CREATE TABLE IF NOT EXISTS Request (request TEXT);");
+  }
 
   http::asio::io_context io_context;
 

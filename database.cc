@@ -1,3 +1,4 @@
+#include <iostream>
 #include <cstring>
 
 #include "database.h"
@@ -106,35 +107,48 @@ Pool::~Pool() {
   connections_.clear();
 }
 
-// it should provide with a timeout parameter.
+// it should be provided with a timeout parameter.
 std::future<ConnectionProxy> Pool::getConnection() {
-  std::unique_lock<std::mutex> lock(mutex_);
   std::promise<ConnectionProxy> promise;
+  auto future = promise.get_future();
+
+  std::unique_lock<std::recursive_mutex> lock(mutex_);
+
   if (size_ > connections_.size()) {
     auto * const connection = new Connection(path_.c_str());
     connections_.insert({connection, false});
     promise.set_value(ConnectionProxy(new Connection(path_.c_str()), this));
-    return promise.get_future();
+    return future;
   }
 
-  while (true) {
-    condition_variable_.wait(lock, [this]{ return 0 < available_; });
+  if (0 < available_) {
     for (auto & item : connections_) {
       if (item.second) {
         item.second = false;
         --available_;
         promise.set_value(ConnectionProxy(item.first, this));
-        return promise.get_future();
+        return future;
       }
     }
   }
+
+  queue_.emplace_back(std::move(promise));
+
+  lock.unlock();
+
+  return future;
 }
 
 void Pool::release(Connection * const connection) {
-  std::lock_guard<std::mutex> lock(mutex_);
-  connections_[connection] = true;
-  ++available_;
-  condition_variable_.notify_one();
+  std::lock_guard<std::recursive_mutex> lock(mutex_);
+  if ( ! queue_.empty()) {
+    auto promise = std::move(queue_.front());
+    queue_.pop_front();
+    promise.set_value(ConnectionProxy(connection, this));
+  } else {
+    connections_[connection] = true;
+    ++available_;
+  }
 }
 
 ConnectionProxy::~ConnectionProxy() {
@@ -143,7 +157,6 @@ ConnectionProxy::~ConnectionProxy() {
     pool_->release(connection_);
   }
 }
-
 
 ConnectionProxy::ConnectionProxy(ConnectionProxy && other) {
   pool_ = other.pool_;
