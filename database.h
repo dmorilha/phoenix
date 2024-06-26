@@ -216,7 +216,7 @@ struct Pool {
   std::condition_variable condition_variable_;
   std::map<Connection *, bool> connections_;
   std::deque<std::promise<ConnectionProxy>> queue_;
-  std::recursive_mutex mutex_;
+  std::mutex mutex_;
 };
 
 struct Cursor {

@@ -112,7 +112,7 @@ std::future<ConnectionProxy> Pool::getConnection() {
   std::promise<ConnectionProxy> promise;
   auto future = promise.get_future();
 
-  std::unique_lock<std::recursive_mutex> lock(mutex_);
+  std::unique_lock<std::mutex> lock(mutex_);
 
   if (size_ > connections_.size()) {
     auto * const connection = new Connection(path_.c_str());
@@ -140,7 +140,7 @@ std::future<ConnectionProxy> Pool::getConnection() {
 }
 
 void Pool::release(Connection * const connection) {
-  std::lock_guard<std::recursive_mutex> lock(mutex_);
+  std::lock_guard<std::mutex> lock(mutex_);
   if ( ! queue_.empty()) {
     auto promise = std::move(queue_.front());
     queue_.pop_front();
