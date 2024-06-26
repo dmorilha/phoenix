@@ -113,7 +113,7 @@ int main(int, const char * * argv) {
     ->accept<MySession>(std::make_tuple(pool));
 
   const size_t THREAD_COUNT = 4;
-  std::vector<std::thread> threads;
+  std::vector<std::jthread> threads;
   threads.reserve(THREAD_COUNT);
   for (auto i = THREAD_COUNT - 1; i > 0; --i) {
     threads.emplace_back([&io_context]{
@@ -128,10 +128,6 @@ int main(int, const char * * argv) {
   });
 
   io_context.run();
-
-  for (auto & thread : threads) {
-    thread.join();
-  }
 
   return 0;
 }
